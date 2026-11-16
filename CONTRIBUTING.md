@@ -197,7 +197,7 @@ Use the constants defined in `src/error.rs` (`EXIT_SUCCESS`, `EXIT_RUNTIME_ERR`,
 ### 11. Typed Error Architecture & Property-Based Testing
 - All subsystem operations must return `VapourResult<T>` and construct typed `VapourError` variants (defined in [`src/error.rs`](src/error.rs)).
 - When formatting user-facing failures, map to standardized POSIX exit codes using `err.exit_code()`.
-- Parsers handling arbitrary binary input (such as `parse_shortcuts_vdf`) must be covered by `proptest` property-based fuzz tests to mathematically guarantee zero panic on arbitrary byte buffers.
+- Parsers handling arbitrary binary input (such as `parse_shortcuts_vdf`) must be covered by `proptest` property-based fuzz tests so random and malformed byte buffers are checked not to panic.
 
 ### 12. CLI <-> Daemon Mutual Exclusion & Safe X11 Close Requests
 - **CLI Session Locks (`CliSessionGuard`)**: When launching games via the CLI (`vapour <game>`), acquire `CliSessionGuard::acquire(appid)`. This maintains an RAII PID lockfile in `/dev/shm/u<uid>-vapour-cli-<appid>.pid`. Background supervisor daemons must check `is_cli_supervised(appid)` and yield supervision completely to prevent dual-reclamation and competing lifecycle shutdown signals.
@@ -205,7 +205,7 @@ Use the constants defined in `src/error.rs` (`EXIT_SUCCESS`, `EXIT_RUNTIME_ERR`,
 
 ### 13. Desktop Notifications & Brand Icon Resolution
 - **Minimal, Non-Intrusive Notifications**: Desktop notifications sent via `send_notification` must remain concise and professional. Never send mid-game popups during active gameplay (e.g. secondary compaction passes), and avoid verbose "vibecoded" text or multi-stage redundant popups on game exit.
-- **Brand Icon Embedding (`ensure_vapour_icon`)**: Desktop notifications use the embedded 512×512 Vapour brand logo (`assets/vapour-logo.png`). The daemon ensures the icon is written to `~/.local/share/icons/hicolor/512x512/apps/vapour.png` and passes its absolute path to `notify-send -i <path>`, guaranteeing immediate rendering across all Linux desktop environments and notification daemons without external dependencies.
+- **Brand Icon Embedding (`ensure_vapour_icon`)**: Desktop notifications use the embedded 512×512 Vapour brand logo (`assets/vapour-logo.png`). The daemon ensures the icon is written to `~/.local/share/icons/hicolor/512x512/apps/vapour.png` and passes its absolute path to `notify-send -i <path>`, so notification daemons that accept an icon path show it without an installed icon theme.
 
 ---
 
