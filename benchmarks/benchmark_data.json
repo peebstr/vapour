@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-11-02T15:19:41Z",
+  "mode": "live",
+  "iterations": 5,
+  "metrics": {
+    "target_pid": 77380,
+    "pre_reclaim_rss_mb": 1213,
+    "pre_reclaim_core_rss_mb": 108,
+    "pre_reclaim_cef_rss_mb": 1104,
+    "vapour_core_rss_mb": 44,
+    "vapour_swap_mb": 946,
+    "ram_saved_mb": 1169,
+    "savings_percentage": 96.4,
+    "status_cmd_ms": 4,
+    "zram_compression_ratio": "4.29x",
+    "psi_avg10": "0.00%",
+    "minor_faults": 28950,
+    "major_faults": 1411
+  }
+}

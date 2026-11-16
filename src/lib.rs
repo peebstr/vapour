@@ -1,0 +1,15 @@
+pub mod cli;
+pub mod config;
+pub mod daemon;
+pub mod desktop;
+pub mod doctor;
+pub mod error;
+pub mod launcher;
+pub mod library;
+pub mod mount;
+pub mod non_steam;
+pub mod prune;
+pub mod runner;
+pub mod session;
+pub mod telemetry;
+pub mod watcher;

@@ -1,0 +1,29 @@
+[2026-11-02 12:40:04] [AppID 7] Currently already synced to global change number '411', should be nothing to download
+[2026-11-02 12:17:45] [AppID 730] Starting sync (up,AC Exit,)
+[2026-11-02 12:17:45] [AppID 730] Running AutoCloud on exit. Looking for new and updated files
+[2026-11-02 12:17:45] [AppID 730] AutoCloud complete
+[2026-11-02 12:17:45] [AppID 730] Currently already synced to global change number '1412', should be nothing to download
+[2026-11-02 12:17:45] [AppID 730] Need to upload file cfg/cs2_preferred_items.txt
+[2026-11-02 12:17:45] [AppID 730] Need to upload file cs2_user_convars.vcfg
+[2026-11-02 12:17:46] [AppID 730] Upload batch initiated, ID: 3919092679295049100, ChangeNumber: 1413, App Build ID: 26334290
+[2026-11-02 12:17:46] [AppID 730] HTTP upload for file 'cs2_user_convars.vcfg' beginning . . .
+[2026-11-02 12:17:46] [AppID 730] HTTP upload for file 'cfg/cs2_preferred_items.txt' beginning . . .
+[2026-11-02 12:17:46] [AppID 730] HTTP upload for file 'cs2_user_convars.vcfg' (offset=0, length=3296) to (0.0.0.0 / 0.0.0.0, host: steamcloud-mumbai.storage.googleapis.com), path /00/00/00/00/730/000.dat - success.
+[2026-11-02 12:17:46] [AppID 730] HTTP upload for file 'cfg/cs2_preferred_items.txt' (offset=0, length=1524) to (0.0.0.0 / 0.0.0.0, host: steamcloud-mumbai.storage.googleapis.com), path /00/00/00/00/730/000.dat - success.
+[2026-11-02 12:17:47] [AppID 730] Upload OK for file cs2_user_convars.vcfg
+[2026-11-02 12:17:47] [AppID 730] Upload OK for file cfg/cs2_preferred_items.txt
+[2026-11-02 12:17:47] [AppID 730] Upload complete, result OK
+[2026-11-02 12:17:47] [AppID 241100] Starting sync (up,AC Exit,)
+[2026-11-02 12:17:47] [AppID 241100] Running AutoCloud on exit. Looking for new and updated files
+[2026-11-02 12:17:47] [AppID 241100]     Evaluating rule 0 with root="GameInstall" path="12345678/config" pattern="*.vdf" (recursive)
+[2026-11-02 12:17:47] [AppID 241100]         Found 3 files that match /home/user/.local/share/Steam/steamapps/common/Steam Controller Configs/12345678/config/*.vdf
+[2026-11-02 12:17:47] [AppID 241100]     Persisting file /home/user/.local/share/Steam/steamapps/common/Steam Controller Configs/12345678/config/preferences_45e-b13-47b50ea0.vdf to the cloud
+[2026-11-02 12:17:47] [AppID 241100]	Skipping un-modified file 12345678/config/preferences_45e-b13-47b50ea0.vdf
+[2026-11-02 12:17:47] [AppID 241100]     Persisting file /home/user/.local/share/Steam/steamapps/common/Steam Controller Configs/12345678/config/configset_controller_xboxone.vdf to the cloud
+[2026-11-02 12:17:47] [AppID 241100]	Skipping un-modified file 12345678/config/configset_controller_xboxone.vdf
+[2026-11-02 12:17:47] [AppID 241100]     Persisting file /home/user/.local/share/Steam/steamapps/common/Steam Controller Configs/12345678/config/configset_45e-b13-47b50ea0.vdf to the cloud
+[2026-11-02 12:17:47] [AppID 241100]	Skipping un-modified file 12345678/config/configset_45e-b13-47b50ea0.vdf
+[2026-11-02 12:17:47] [AppID 241100] AutoCloud complete
+[2026-11-02 12:17:47] [AppID 730] YldWriteCacheDirectoryToFile - saved to '/home/user/.local/share/Steam/userdata/12345678/730/remotecache.vdf'
+[2026-11-02 12:17:47] [AppID 241100] Currently already synced to global change number '16', should be nothing to download
+[2026-11-02 12:17:47] [AppID 241100] Upload complete in build list

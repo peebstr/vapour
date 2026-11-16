@@ -1,0 +1,14 @@
+[Unit]
+Description=Vapour Game Lifecycle Supervisor
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vapour daemon --foreground
+Restart=on-failure
+RestartSec=3
+Slice=app.slice
+
+[Install]
+WantedBy=graphical-session.target
