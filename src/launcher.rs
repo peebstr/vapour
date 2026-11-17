@@ -292,17 +292,30 @@ pub fn ensure_steam_daemon(
                                 bootstrap_offset = len;
                                 for line in buf.lines() {
                                     let t = line.trim();
-                                    if t.contains("Downloading update")
+                                    // "Verifying installation" is logged on every start, so it is not a signal.
+                                    let dl = parse_bootstrap_download(t);
+                                    if dl.is_some()
                                         || t.contains("Extracting package")
                                         || t.contains("Installing update")
-                                        || t.contains("Verifying installation")
                                     {
                                         if !update_detected {
                                             println!("\x1b[33m[UPDATE]\x1b[0m Steam client self-update in progress...");
                                             update_detected = true;
                                             max_wait_secs = 120; // Extend timeout for update download & installation
                                         }
-                                        println!("       {}", t);
+                                        if let Some((done, total)) = dl {
+                                            let pct = done as f64 / total as f64 * 100.0;
+                                            print!(
+                                                "\r       {} {:>5.1}% ({:.1}/{:.1} MB)",
+                                                crate::watcher::render_progress_bar(pct, 18),
+                                                pct,
+                                                done as f64 / 1024.0,
+                                                total as f64 / 1024.0
+                                            );
+                                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                                        } else {
+                                            println!("\n       {}", t);
+                                        }
                                     }
                                 }
                             }
@@ -381,8 +394,82 @@ pub fn shutdown_steam() -> VapourResult<()> {
     Ok(())
 }
 
+/// Over SSH the login shell has no desktop variables. Fill in what a local session would have:
+/// the runtime dir, the user bus, and the display sockets of the running desktop session.
+/// Never overrides a variable that is already set.
+pub fn adopt_session_env() {
+    let set_if_unset = |k: &str, v: String| {
+        if std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+        }
+    };
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let rt = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+    if !rt.is_dir() {
+        return;
+    }
+    set_if_unset("XDG_RUNTIME_DIR", rt.display().to_string());
+    if rt.join("bus").exists() {
+        set_if_unset(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/bus", rt.display()),
+        );
+    }
+    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return;
+    }
+    // shortcut: takes the lowest-numbered socket, wrong on multi-seat or nested sessions.
+    let lowest = |dir: &Path, prefix: &str| {
+        let mut found: Vec<String> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| {
+                n.strip_prefix(prefix)
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .collect();
+        found.sort();
+        found.into_iter().next()
+    };
+    if let Some(w) = lowest(&rt, "wayland-") {
+        set_if_unset("WAYLAND_DISPLAY", w);
+    }
+    if let Some(x) = lowest(Path::new("/tmp/.X11-unix"), "X") {
+        set_if_unset("DISPLAY", format!(":{}", &x[1..]));
+    }
+}
+
+/// Parses `Downloading update (2,818 of 174,509 KB)...` into `(done_kb, total_kb)`.
+fn parse_bootstrap_download(line: &str) -> Option<(u64, u64)> {
+    let rest = line.split("Downloading update (").nth(1)?;
+    let (done, rest) = rest.split_once(" of ")?;
+    let total = rest.split_once(" KB")?.0;
+    let num = |s: &str| s.replace(',', "").trim().parse::<u64>().ok();
+    let total = num(total)?;
+    (total > 0).then_some((num(done)?, total))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_download_parses() {
+        assert_eq!(
+            super::parse_bootstrap_download(
+                "[2026-09-06 17:15:24] Downloading update (2,818 of 174,509 KB)..."
+            ),
+            Some((2818, 174509))
+        );
+        assert_eq!(
+            super::parse_bootstrap_download("Verifying installation..."),
+            None
+        );
+    }
+
     #[test]
     fn comm_is_steam_should_match_only_steam() {
         assert!(super::comm_is_steam("steam\n"));
@@ -404,10 +491,6 @@ mod tests {
             overlay: true,
             keep_steam: false,
             nojoy: false,
-            gamemode: false,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
             wrapper: None,
             env: Vec::new(),
             extra_args: vec!["-novid".to_string()],
@@ -427,10 +510,6 @@ mod tests {
             overlay: false,
             keep_steam: false,
             nojoy: false,
-            gamemode: false,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
             wrapper: None,
             env: Vec::new(),
             extra_args: Vec::new(),
@@ -450,10 +529,6 @@ mod tests {
             overlay: true,
             keep_steam: false,
             nojoy: false,
-            gamemode: false,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
             wrapper: None,
             env: Vec::new(),
             extra_args: Vec::new(),

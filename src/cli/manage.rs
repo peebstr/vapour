@@ -488,15 +488,18 @@ pub fn interactive_game_settings(config: &mut VapourConfig) {
                     Some(false) => "Always OFF (Suppressed)",
                     None => "Use Global Default",
                 };
-                let args_str = if game_cfg.extra_args.is_empty() {
-                    "None".to_string()
-                } else {
-                    game_cfg.extra_args.join(" ")
-                };
-
+                let steam_opts =
+                    library::get_steam_localconfig_launch_options(game.appid).unwrap_or_default();
                 let menu = vec![
                     format!("Overlay:           [{}]", ov_status),
-                    format!("Extra Launch Args: [{}]", args_str),
+                    format!(
+                        "Steam Launch Options: [{}]",
+                        if steam_opts.is_empty() {
+                            "None"
+                        } else {
+                            &steam_opts
+                        }
+                    ),
                     "Done".to_string(),
                 ];
 
@@ -521,17 +524,19 @@ pub fn interactive_game_settings(config: &mut VapourConfig) {
                             _ => game_cfg.overlay = None,
                         }
                     }
-                } else if action.starts_with("Extra Launch Args:") {
-                    if let Ok(new_args) =
-                        Text::new("Extra launch flags (space separated, or empty for none):")
-                            .with_default(&args_str)
+                } else if action.starts_with("Steam Launch Options:") {
+                    if let Ok(opts) =
+                        Text::new("Steam Launch Options (replaces the current ones; empty clears):")
+                            .with_initial_value(&steam_opts)
                             .prompt()
                     {
-                        game_cfg.extra_args = new_args
-                            .split_whitespace()
-                            .filter(|s| *s != "None")
-                            .map(String::from)
-                            .collect();
+                        let formatted = config::format_launch_options(&opts);
+                        match library::write_steam_localconfig_launch_options(
+                            game.appid, &game.name, &formatted,
+                        ) {
+                            Ok(()) => game_cfg.launch_options = None,
+                            Err(e) => eprintln!("\x1b[31m[ERROR]\x1b[0m {e}"),
+                        }
                     }
                 } else {
                     break;
@@ -558,21 +563,10 @@ pub fn interactive_game_settings(config: &mut VapourConfig) {
                     .or(ng.compat_tool.as_deref())
                     .unwrap_or("Native / None");
                 let launch_opts_str = game_cfg.launch_options.as_deref().unwrap_or("None");
-                let args_str = if game_cfg.extra_args.is_empty() {
-                    if ng.args.is_empty() {
-                        "None".to_string()
-                    } else {
-                        ng.args.join(" ")
-                    }
-                } else {
-                    game_cfg.extra_args.join(" ")
-                };
-
                 let menu = vec![
                     format!("Executable Path:      [{}]", exe_status),
                     format!("Compatibility Tool:   [{}]", current_tool),
                     format!("Steam Launch Options: [{}]", launch_opts_str),
-                    format!("Extra Launch Args:    [{}]", args_str),
                     "Done".to_string(),
                 ];
 
@@ -614,9 +608,18 @@ pub fn interactive_game_settings(config: &mut VapourConfig) {
                         }
                     }
                 } else if action.starts_with("Steam Launch Options:") {
+                    if let Err(e) = library::ensure_game_not_running(ng.appid, &ng.name) {
+                        eprintln!("\x1b[31m[ERROR]\x1b[0m {e}");
+                        continue;
+                    }
+                    let current = game_cfg
+                        .launch_options
+                        .clone()
+                        .filter(|o| !o.is_empty())
+                        .unwrap_or_else(|| ng.launch_options.clone());
                     if let Ok(opts) =
-                        Text::new("Steam Launch Options (e.g. %command% or env vars):")
-                            .with_default(game_cfg.launch_options.as_deref().unwrap_or(""))
+                        Text::new("Launch Options (replaces the current ones; empty clears):")
+                            .with_initial_value(&current)
                             .prompt()
                     {
                         let formatted = config::format_launch_options(&opts);
@@ -629,18 +632,6 @@ pub fn interactive_game_settings(config: &mut VapourConfig) {
                         vdf_ok(update_shortcut_launch_options_in_all_vdf(
                             ng.appid, &formatted,
                         ));
-                    }
-                } else if action.starts_with("Extra Launch Args:") {
-                    if let Ok(new_args) =
-                        Text::new("Extra launch flags (space separated, or empty for none):")
-                            .with_default(&args_str)
-                            .prompt()
-                    {
-                        game_cfg.extra_args = new_args
-                            .split_whitespace()
-                            .filter(|s| *s != "None")
-                            .map(String::from)
-                            .collect();
                     }
                 } else {
                     break;
@@ -700,46 +691,71 @@ pub fn handle_set_launch_options(
     query: &str,
     raw_options: &str,
 ) -> VapourResult<()> {
-    let non_steam = load_non_steam_games(config);
-    let items: Vec<PlayableItem> = non_steam.into_iter().map(PlayableItem::NonSteam).collect();
-    let item = match find_item_by_query(&items, query) {
-        Some(PlayableItem::NonSteam(ng)) => ng,
-        _ => {
-            return Err(VapourError::Runtime(format!(
-                "No Non-Steam game found matching '{}'",
-                query
-            )));
-        }
-    };
-
-    let key = item.appid.to_string();
-    let replaced = config.get_game_config(&key).extra_args;
-    let formatted = config.update_game_launch_options(&key, raw_options)?;
-    if !replaced.is_empty() {
-        println!(
-            "\x1b[33m[NOTICE]\x1b[0m Replaced previous arguments: {}",
-            replaced.join(" ")
-        );
-    }
-
-    let vdf_updated = item.from_steam_shortcut
-        && vdf_ok(update_shortcut_launch_options_in_all_vdf(
-            item.appid, &formatted,
-        ));
-
-    println!(
-        "\x1b[32m[OK]\x1b[0m Updated Launch Options for '{}' (AppID: {}):",
-        item.name, item.appid
+    let mut items: Vec<PlayableItem> = get_installed_games(false)
+        .unwrap_or_default()
+        .into_iter()
+        .map(PlayableItem::Steam)
+        .collect();
+    items.extend(
+        load_non_steam_games(config)
+            .into_iter()
+            .map(PlayableItem::NonSteam),
     );
+    let item = find_item_by_query(&items, query)
+        .ok_or_else(|| VapourError::Runtime(format!("No game found matching '{}'", query)))?;
+
+    match item {
+        PlayableItem::Steam(game) => {
+            let formatted = config::format_launch_options(raw_options);
+            library::write_steam_localconfig_launch_options(game.appid, &game.name, &formatted)?;
+            // Steam applies these itself now; a copy in settings.toml would be applied twice.
+            let key = game.appid.to_string();
+            let mut cfg = config.get_game_config(&key);
+            if cfg.launch_options.take().is_some() {
+                config.games.insert(key, cfg);
+                config.save()?;
+            }
+            println!(
+                "\x1b[32m[OK]\x1b[0m Updated Launch Options for '{}' (AppID: {}):",
+                game.name, game.appid
+            );
+            print_launch_options(&formatted);
+            println!("     Steam localconfig.vdf: Updated");
+        }
+        PlayableItem::NonSteam(item) => {
+            library::ensure_game_not_running(item.appid, &item.name)?;
+            let key = item.appid.to_string();
+            let replaced = config.get_game_config(&key).extra_args;
+            let formatted = config.update_game_launch_options(&key, raw_options)?;
+            if !replaced.is_empty() {
+                println!(
+                    "\x1b[33m[NOTICE]\x1b[0m Replaced previous arguments: {}",
+                    replaced.join(" ")
+                );
+            }
+            let vdf_updated = item.from_steam_shortcut
+                && vdf_ok(update_shortcut_launch_options_in_all_vdf(
+                    item.appid, &formatted,
+                ));
+            println!(
+                "\x1b[32m[OK]\x1b[0m Updated Launch Options for '{}' (AppID: {}):",
+                item.name, item.appid
+            );
+            print_launch_options(&formatted);
+            if vdf_updated {
+                println!("     Steam shortcuts.vdf: Updated");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_launch_options(formatted: &str) {
     if formatted.is_empty() {
         println!("     Launch Options: (cleared)");
     } else {
         println!("     Launch Options: {}", formatted);
     }
-    if vdf_updated {
-        println!("     Steam shortcuts.vdf: Updated");
-    }
-    Ok(())
 }
 
 pub fn interactive_delete_non_steam(config: &mut VapourConfig) {

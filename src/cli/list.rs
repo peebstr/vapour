@@ -311,27 +311,6 @@ pub fn show_selected_item_info(item: &PlayableItem, config: &VapourConfig) {
                     "\x1b[33mDISABLED (Daemon stays resident)\x1b[0m"
                 }
             );
-            println!(
-                "  Wrappers:            gamemode: {}, mangohud: {}, gamescope: {}",
-                if resolved.gamemode {
-                    "\x1b[32mYES\x1b[0m"
-                } else {
-                    "\x1b[37mNO\x1b[0m"
-                },
-                if resolved.mangohud {
-                    "\x1b[32mYES\x1b[0m"
-                } else {
-                    "\x1b[37mNO\x1b[0m"
-                },
-                if resolved.gamescope {
-                    "\x1b[32mYES\x1b[0m"
-                } else {
-                    "\x1b[37mNO\x1b[0m"
-                },
-            );
-            if let Some(ref ga) = resolved.gamescope_args {
-                println!("  Gamescope Flags:     {}", ga);
-            }
             if let Some(ref w) = resolved.wrapper {
                 println!("  Custom Wrapper:      {}", w);
             }
@@ -408,27 +387,6 @@ pub fn show_selected_item_info(item: &PlayableItem, config: &VapourConfig) {
                     "\x1b[33mSUPPRESSED\x1b[0m"
                 }
             );
-            println!(
-                "  Wrappers:            gamemode: {}, mangohud: {}, gamescope: {}",
-                if resolved.gamemode {
-                    "\x1b[32mYES\x1b[0m"
-                } else {
-                    "\x1b[37mNO\x1b[0m"
-                },
-                if resolved.mangohud {
-                    "\x1b[32mYES\x1b[0m"
-                } else {
-                    "\x1b[37mNO\x1b[0m"
-                },
-                if resolved.gamescope {
-                    "\x1b[32mYES\x1b[0m"
-                } else {
-                    "\x1b[37mNO\x1b[0m"
-                },
-            );
-            if let Some(ref ga) = resolved.gamescope_args {
-                println!("  Gamescope Flags:     {}", ga);
-            }
             if let Some(ref w) = resolved.wrapper {
                 println!("  Custom Wrapper:      {}", w);
             }

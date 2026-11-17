@@ -1,6 +1,7 @@
 //! Shared game-lifecycle mechanism: process tracking, cgroup reclaim, PSI, cloud-sync wait.
 //! The CLI watcher (`watcher.rs`) and the daemon (`daemon.rs`) are thin drivers over this module.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -258,7 +259,17 @@ fn read_cgroup_u64(path: &Path) -> Option<u64> {
 /// Matches both dedicated `vapour-steam-*.scope` daemon scopes and pressure-vessel `app-steam-unknown-*.scope`
 /// units created for CEF renderers.
 /// Explicitly excludes game scopes (`app-steam-app*`) to guarantee game memory is never evicted.
+/// Also skips cgroups holding game wrappers (see [`game_launch_chain_cgroups`]). Use
+/// [`steam_cgroup_dirs_unfiltered`] to measure memory instead of reclaiming it.
 pub fn find_steam_cgroup_dirs() -> Vec<PathBuf> {
+    let protected = game_launch_chain_cgroups();
+    let mut dirs = steam_cgroup_dirs_unfiltered();
+    dirs.retain(|d| !protected.contains(d));
+    dirs
+}
+
+/// Every Steam cgroup, including ones that hold game wrappers. For telemetry only.
+pub fn steam_cgroup_dirs_unfiltered() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
@@ -320,6 +331,167 @@ pub fn find_steam_cgroup_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Cgroups (outside the game scope) holding wrappers between `steam` and the game, e.g. gamescope.
+/// Reclaiming them evicts the frame loop's pages and collapses fps. `memory.reclaim` works per
+/// cgroup, so the whole cgroup is skipped. The game's own scope is excluded by name elsewhere.
+fn game_launch_chain_cgroups() -> HashSet<PathBuf> {
+    wrapper_chain_cgroups(&read_proc_table())
+}
+
+fn read_proc_table() -> HashMap<u32, ProcInfo> {
+    let mut procs: HashMap<u32, ProcInfo> = HashMap::new();
+    for e in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(e.path().join("stat")) else {
+            continue;
+        };
+        // comm is parenthesised and may contain spaces; ppid is the 2nd field after the last ')'.
+        let Some((head, tail)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let Some(ppid) = tail.split_whitespace().nth(1).and_then(|v| v.parse().ok()) else {
+            continue;
+        };
+        let cgroup = fs::read_to_string(e.path().join("cgroup"))
+            .ok()
+            .and_then(|cg| {
+                cg.lines()
+                    .find_map(|l| l.strip_prefix("0::"))
+                    .map(|rel| Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+            });
+        procs.insert(
+            pid,
+            ProcInfo {
+                ppid,
+                comm: head.split_once('(').map_or("", |h| h.1).to_string(),
+                cgroup,
+            },
+        );
+    }
+    procs
+}
+
+struct ProcInfo {
+    ppid: u32,
+    comm: String,
+    cgroup: Option<PathBuf>,
+}
+
+/// Steam's own launcher plumbing, which sits between `steam` and the game but is not a user wrapper.
+fn is_steam_plumbing(comm: &str) -> bool {
+    comm.starts_with("steam")
+        || comm.starts_with("srt-")
+        || comm.starts_with("pv-")
+        || comm.starts_with("x86_64-linux-gn")
+        || comm == "bash"
+        || comm == "reaper"
+}
+
+fn in_game_scope(info: &ProcInfo) -> bool {
+    info.cgroup.as_ref().is_some_and(|cg| {
+        cg.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("app-steam-app"))
+    })
+}
+
+/// PIDs of user wrappers (gamescope, mangohud, ...) between `steam` and the game, plus their
+/// children (e.g. gamescope's Xwayland), outside the game scope.
+fn wrapper_pids(procs: &HashMap<u32, ProcInfo>) -> HashSet<u32> {
+    let mut roots = HashSet::new();
+    for (&pid, info) in procs {
+        if !in_game_scope(info) {
+            continue;
+        }
+        let mut chain = Vec::new();
+        let mut cur = pid;
+        for _ in 0..64 {
+            let Some(pp) = procs.get(&cur).map(|i| i.ppid) else {
+                break;
+            };
+            if pp <= 1 {
+                break;
+            }
+            if procs.get(&pp).is_some_and(|i| i.comm == "steam") {
+                roots.extend(chain.iter().copied().filter(|p| {
+                    procs
+                        .get(p)
+                        .is_some_and(|i| !in_game_scope(i) && !is_steam_plumbing(&i.comm))
+                }));
+                break;
+            }
+            chain.push(pp);
+            cur = pp;
+        }
+    }
+    let mut out = HashSet::new();
+    for (&pid, info) in procs {
+        if in_game_scope(info) {
+            continue;
+        }
+        let mut cur = pid;
+        for _ in 0..64 {
+            if roots.contains(&cur) {
+                out.insert(pid);
+                break;
+            }
+            match procs.get(&cur) {
+                Some(i) if i.ppid > 1 => cur = i.ppid,
+                _ => break,
+            }
+        }
+    }
+    out
+}
+
+/// Summed `VmRSS` of the game wrappers. Shared pages are counted once per process, so this
+/// overstates a little; telemetry shows it as an estimate.
+pub fn game_wrapper_rss_bytes() -> u64 {
+    wrapper_pids(&read_proc_table())
+        .into_iter()
+        .filter_map(|pid| fs::read_to_string(format!("/proc/{pid}/status")).ok())
+        .filter_map(|st| {
+            st.lines()
+                .find_map(|l| l.strip_prefix("VmRSS:"))
+                .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        })
+        .sum::<u64>()
+        * 1024
+}
+
+/// Walks up from every process in a game scope to `steam`. The processes in between are the
+/// wrappers; their cgroups are returned. Chains that never reach `steam` are ignored.
+fn wrapper_chain_cgroups(procs: &HashMap<u32, ProcInfo>) -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    for (&pid, info) in procs {
+        let in_game_scope = info.cgroup.as_ref().is_some_and(|cg| {
+            cg.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("app-steam-app"))
+        });
+        if !in_game_scope {
+            continue;
+        }
+        let mut chain = Vec::new();
+        let mut cur = pid;
+        for _ in 0..64 {
+            let Some(pp) = procs.get(&cur).map(|i| i.ppid) else {
+                break;
+            };
+            if pp <= 1 {
+                break;
+            }
+            if procs.get(&pp).is_some_and(|i| i.comm == "steam") {
+                out.extend(chain.iter().filter_map(|p| procs[p].cgroup.clone()));
+                break;
+            }
+            chain.push(pp);
+            cur = pp;
+        }
+    }
+    out
+}
+
 /// Result of a kernel cgroup v2 memory reclamation pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReclaimResult {
@@ -332,12 +504,27 @@ pub struct ReclaimResult {
 /// 0 = unknown, 1 = `swappiness=` accepted, 2 = rejected (kernel < 6.11).
 static SWAPPINESS_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Asks the kernel to reclaim up to 1500M. Uses the `swappiness=200` bias to push idle CEF heap
+/// Builds the `memory.reclaim` request, e.g. `1500M swappiness=200\n`. The key is dropped on kernels < 6.11.
+fn reclaim_request(mb: u64, swappiness: u32, with_swappiness: bool) -> String {
+    if with_swappiness {
+        format!("{mb}M swappiness={swappiness}\n")
+    } else {
+        format!("{mb}M\n")
+    }
+}
+
+/// Asks the kernel to reclaim up to `cfg.reclaim_bytes_mb`. The `swappiness=` bias pushes idle CEF heap
 /// into swap/zRAM; after the first EINVAL it remembers the kernel lacks it and writes the plain request.
-fn write_reclaim_request(reclaim_file: &Path) -> std::io::Result<()> {
+fn write_reclaim_request(
+    reclaim_file: &Path,
+    cfg: &crate::config::DaemonConfig,
+) -> std::io::Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
     if SWAPPINESS_STATE.load(Relaxed) != 2 {
-        match std::fs::write(reclaim_file, "1500M swappiness=200\n") {
+        match std::fs::write(
+            reclaim_file,
+            reclaim_request(cfg.reclaim_bytes_mb, cfg.swappiness, true),
+        ) {
             Ok(()) => {
                 SWAPPINESS_STATE.store(1, Relaxed);
                 return Ok(());
@@ -352,7 +539,10 @@ fn write_reclaim_request(reclaim_file: &Path) -> std::io::Result<()> {
             }
         }
     }
-    std::fs::write(reclaim_file, "1500M\n")
+    std::fs::write(
+        reclaim_file,
+        reclaim_request(cfg.reclaim_bytes_mb, cfg.swappiness, false),
+    )
 }
 
 /// Kernel capabilities, each found by trying the feature (never from `uname`).
@@ -426,6 +616,9 @@ pub fn reclaim_steam_memory() -> Result<ReclaimResult, crate::error::VapourError
         )));
     }
 
+    let daemon_cfg = crate::config::VapourConfig::load_checked()
+        .map(|c| c.daemon)
+        .unwrap_or_default();
     let mut total_swap_delta: u64 = 0;
     let mut total_mem_freed: u64 = 0;
     let mut any_reclaimed = false;
@@ -442,7 +635,7 @@ pub fn reclaim_steam_memory() -> Result<ReclaimResult, crate::error::VapourError
         let swap_before = read_cgroup_u64(&swap_file).unwrap_or(0);
         let mem_before = read_cgroup_u64(&mem_file).unwrap_or(0);
 
-        let write_res = write_reclaim_request(&reclaim_file);
+        let write_res = write_reclaim_request(&reclaim_file, &daemon_cfg);
 
         let is_reclaimed = match write_res {
             Ok(_) => true,
@@ -585,6 +778,40 @@ pub enum CloudOutcome {
     Conflict,
 }
 
+/// Appends `entry` to `existing`, keeping only the last `cap` bytes (on a char boundary).
+fn append_capped(existing: &str, entry: &str, cap: usize) -> String {
+    let mut text = format!("{existing}{entry}");
+    if text.len() > cap {
+        let cut = text.len() - cap;
+        let start = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| i >= cut)
+            .unwrap_or(0);
+        text = text[start..].to_string();
+    }
+    text
+}
+
+/// Saves the raw per-AppID cloud lines to `~/.cache/vapour/cloud_unknown.log` so a wrong
+/// conflict marker or a changed log format can be reported with evidence.
+fn record_cloud_unknown(appid: u32, reason: &str, lines: &[String]) {
+    let Some(home) = crate::library::home_dir() else {
+        return;
+    };
+    let path = home.join(".cache/vapour/cloud_unknown.log");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut entry = format!("# AppID {appid}: {reason}\n");
+    for l in lines {
+        entry.push_str(l);
+        entry.push('\n');
+    }
+    let _ = crate::non_steam::write_atomic(
+        &path,
+        append_capped(&existing, &entry, 64 * 1024).as_bytes(),
+    );
+}
+
 /// Waits for the exit cloud sync of `appid` (invariants 6 and 7 apply).
 pub fn wait_cloud(appid: u32, game_name: &str) -> CloudOutcome {
     let is_non_steam = (appid & 0x80000000) != 0;
@@ -605,6 +832,8 @@ pub fn wait_cloud(appid: u32, game_name: &str) -> CloudOutcome {
         let sync_start = Instant::now();
         let mut cloud_state = CloudState::Waiting;
         let mut last_activity = Instant::now();
+        let mut seen: Vec<String> = Vec::new();
+        let appid_tag = format!("[AppID {appid}]");
 
         while sync_start.elapsed() < Duration::from_secs(60) {
             if let Some(ref path) = cloud_path {
@@ -617,6 +846,9 @@ pub fn wait_cloud(appid: u32, game_name: &str) -> CloudOutcome {
                                 if file.read_to_string(&mut buf).is_ok() {
                                     cloud_offset = len;
                                     for line in buf.lines() {
+                                        if seen.len() < 200 && line.contains(&appid_tag) {
+                                            seen.push(line.to_string());
+                                        }
                                         cloud_state = cloud_step(cloud_state, line, appid);
                                     }
                                 }
@@ -641,12 +873,14 @@ pub fn wait_cloud(appid: u32, game_name: &str) -> CloudOutcome {
         let sync_conflict = cloud_state == CloudState::Conflict;
         let sync_confirmed = cloud_state == CloudState::Done;
         if cloud_state == CloudState::ExitSyncStarted {
+            record_cloud_unknown(appid, "exit sync started, no completion line", &seen);
             eprintln!(
-                "[WARN] Steam started an exit cloud sync for AppID {appid} but never logged completion; Steam's cloud_log format may have changed. Please report it to the vapour maintainers."
+                "[WARN] Steam started an exit cloud sync for AppID {appid} but never logged completion; Steam's cloud_log format may have changed. The raw lines are in ~/.cache/vapour/cloud_unknown.log; please attach them to an issue."
             );
         }
 
         if sync_conflict {
+            record_cloud_unknown(appid, "conflict marker matched", &seen);
             eprintln!(
                 "\x1b[1;31m[CLOUD CONFLICT]\x1b[0m Steam Cloud reported a sync conflict for '{}' (AppID {})!",
                 game_name, appid
@@ -780,12 +1014,29 @@ pub fn cgroup_is_vapour_scope(content: &str) -> bool {
     content.contains("/vapour-steam-")
 }
 
-/// True only for a Steam that vapour itself started (it lives in a `vapour-steam-*.scope`).
-/// A user's own `steam -silent` (e.g. tray autostart) is never treated as headless.
+/// True only for a Steam that vapour itself started. The client that `steam.pid` names runs inside
+/// the pressure-vessel container, in an `app-steam-unknown-*.scope`, so its own cgroup does not tell.
+/// Vapour's marker is a populated `vapour-steam-*.scope`. A user's own `steam -silent` has none.
+/// shortcut: a stale vapour scope with leftover processes would mislabel a user's Steam as owned.
 pub fn is_steam_headless() -> bool {
-    crate::launcher::get_steam_pid()
+    let in_vapour_scope = crate::launcher::get_steam_pid()
         .and_then(|pid| fs::read_to_string(format!("/proc/{pid}/cgroup")).ok())
-        .is_some_and(|c| cgroup_is_vapour_scope(&c))
+        .is_some_and(|c| cgroup_is_vapour_scope(&c));
+    in_vapour_scope || has_populated_vapour_scope(&app_slice_path())
+}
+
+fn has_populated_vapour_scope(app_slice: &Path) -> bool {
+    fs::read_dir(app_slice)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("vapour-steam-"))
+        .any(|e| {
+            fs::read_to_string(e.path().join("cgroup.events"))
+                .ok()
+                .and_then(|c| events_populated(&c))
+                == Some(true)
+        })
 }
 
 // ---- Event sources: cgroup.events, PSI triggers, pidfd signals ----
@@ -1247,6 +1498,98 @@ mod engine_tests {
         shutdown_if_headless: true,
         restore_gui_on_exit: true,
     };
+
+    fn proc(ppid: u32, comm: &str, cg: &str) -> ProcInfo {
+        ProcInfo {
+            ppid,
+            comm: comm.into(),
+            cgroup: Some(PathBuf::from(cg)),
+        }
+    }
+
+    #[test]
+    fn wrapper_chain_should_protect_gamescope_cgroup_but_not_steam_helpers() {
+        let procs = HashMap::from([
+            (10, proc(1, "steam", "/a/vapour-steam-1.scope")),
+            (20, proc(10, "gamescope-wl", "/a/vapour-steam-1.scope")),
+            (30, proc(20, "reaper", "/a/app-steam-app730-9.scope")),
+            (40, proc(30, "cs2", "/a/app-steam-app730-9.scope")),
+            (
+                50,
+                proc(10, "steamwebhelper", "/a/app-steam-unknown-2.scope"),
+            ),
+        ]);
+        let got = wrapper_chain_cgroups(&procs);
+        assert!(got.contains(Path::new("/a/vapour-steam-1.scope")));
+        assert!(got.contains(Path::new("/a/app-steam-app730-9.scope")));
+        assert!(!got.contains(Path::new("/a/app-steam-unknown-2.scope")));
+    }
+
+    #[test]
+    fn wrapper_chain_should_ignore_chains_that_never_reach_steam() {
+        let procs = HashMap::from([
+            (20, proc(1, "bash", "/a/session-3.scope")),
+            (40, proc(20, "cs2", "/a/app-steam-app730-9.scope")),
+        ]);
+        assert!(wrapper_chain_cgroups(&procs).is_empty());
+    }
+
+    #[test]
+    fn populated_vapour_scope_should_need_populated_1() {
+        let dir = std::env::temp_dir().join(format!("vapour-test-{}", std::process::id()));
+        let scope = dir.join("vapour-steam-5.scope");
+        fs::create_dir_all(&scope).unwrap();
+        assert!(!has_populated_vapour_scope(&dir));
+        fs::write(scope.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(!has_populated_vapour_scope(&dir));
+        fs::write(scope.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(has_populated_vapour_scope(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_capped_should_keep_the_tail() {
+        assert_eq!(append_capped("ab", "cd", 10), "abcd");
+        assert_eq!(append_capped("abcdef", "gh", 4), "efgh");
+        assert_eq!(append_capped("aé", "é", 3), "é");
+    }
+
+    #[test]
+    fn wrapper_pids_should_pick_gamescope_and_children_but_not_steam_plumbing() {
+        let procs = HashMap::from([
+            (10, proc(1, "steam", "/a/vapour-steam-1.scope")),
+            (11, proc(10, "bash", "/a/vapour-steam-1.scope")),
+            (20, proc(11, "gamescope-wl", "/a/vapour-steam-1.scope")),
+            (21, proc(20, "Xwayland", "/a/vapour-steam-1.scope")),
+            (22, proc(20, "gamescopereaper", "/a/vapour-steam-1.scope")),
+            (30, proc(22, "reaper", "/a/app-steam-app730-9.scope")),
+            (40, proc(30, "cs2", "/a/app-steam-app730-9.scope")),
+            (
+                50,
+                proc(10, "steamwebhelper", "/a/app-steam-unknown-2.scope"),
+            ),
+        ]);
+        let got = wrapper_pids(&procs);
+        assert_eq!(got, HashSet::from([20, 21, 22]));
+    }
+
+    #[test]
+    fn wrapper_pids_should_be_empty_without_a_wrapper() {
+        let procs = HashMap::from([
+            (10, proc(1, "steam", "/a/vapour-steam-1.scope")),
+            (11, proc(10, "srt-client-cont", "/a/vapour-steam-1.scope")),
+            (30, proc(11, "reaper", "/a/app-steam-app730-9.scope")),
+            (40, proc(30, "cs2", "/a/app-steam-app730-9.scope")),
+        ]);
+        assert!(wrapper_pids(&procs).is_empty());
+    }
+
+    #[test]
+    fn reclaim_request_should_use_configured_values() {
+        assert_eq!(reclaim_request(1500, 200, true), "1500M swappiness=200\n");
+        assert_eq!(reclaim_request(800, 100, true), "800M swappiness=100\n");
+        assert_eq!(reclaim_request(800, 100, false), "800M\n");
+    }
 
     #[test]
     fn decide_on_exit_should_shut_down_only_owned_steam_without_keep() {

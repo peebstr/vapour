@@ -662,6 +662,187 @@ pub fn configure_on_demand_updates() -> usize {
     updated_count
 }
 
+/// Splits a VDF line into its quoted strings, honouring `\"` and `\\` escapes.
+fn vdf_quoted_strings(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (in_q, c) {
+            (false, '"') => in_q = true,
+            (true, '"') => {
+                out.push(std::mem::take(&mut cur));
+                in_q = false;
+            }
+            (true, '\\') => match chars.next() {
+                Some('n') => cur.push('\n'),
+                Some('t') => cur.push('\t'),
+                Some(o) => cur.push(o),
+                None => {}
+            },
+            (true, c) => cur.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn vdf_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+}
+
+/// The value of a `"LaunchOptions" "<value>"` line, unescaped.
+fn vdf_launch_options_value(line: &str) -> Option<String> {
+    let q = vdf_quoted_strings(line);
+    (q.len() >= 2 && q[0].eq_ignore_ascii_case("LaunchOptions")).then(|| q[1].trim().to_string())
+}
+
+/// Line range `(open, close)` of the `{ ... }` block of `appid` under the first matching `"apps"` section.
+fn find_app_block(lines: &[&str], appid: u32) -> Option<(usize, usize)> {
+    let target = format!("\"{appid}\"");
+    let brace_delta = |l: &str| {
+        l.chars().filter(|&c| c == '{').count() as i32
+            - l.chars().filter(|&c| c == '}').count() as i32
+    };
+    let (mut in_apps, mut apps_depth) = (false, 0i32);
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if !in_apps {
+            if t.eq_ignore_ascii_case("\"apps\"") {
+                in_apps = true;
+                apps_depth = i32::from(t.ends_with('{'));
+            }
+        } else if t == target
+            || t.starts_with(&format!("{target} "))
+            || t.starts_with(&format!("{target}\t"))
+        {
+            // The opening brace is on this line or the next one.
+            let open = if t.contains('{') { i } else { i + 1 };
+            let mut depth = 0i32;
+            for (j, l) in lines.iter().enumerate().skip(open) {
+                depth += brace_delta(l.trim());
+                if depth <= 0 {
+                    return Some((open, j));
+                }
+            }
+            return None;
+        } else {
+            apps_depth += brace_delta(t);
+            if apps_depth <= 0 {
+                in_apps = false;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns `content` with the `LaunchOptions` of `appid` set to `opts` (line removed when empty).
+/// `None` when localconfig.vdf has no entry for the app: Steam creates it on the first launch.
+pub fn set_localconfig_launch_options(content: &str, appid: u32, opts: &str) -> Option<String> {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let (open, close) = find_app_block(&lines, appid)?;
+
+    // A `LaunchOptions` line directly inside the block (depth 1), not in a nested block.
+    let mut depth = 0i32;
+    let mut existing = None;
+    for (j, l) in lines.iter().enumerate().take(close + 1).skip(open) {
+        let t = l.trim();
+        if depth == 1 && vdf_launch_options_value(t).is_some() {
+            existing = Some(j);
+        }
+        depth += t.chars().filter(|&c| c == '{').count() as i32
+            - t.chars().filter(|&c| c == '}').count() as i32;
+    }
+
+    let eol = if lines[open].ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let block_indent: String = lines[open]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let new_line = format!(
+        "{block_indent}\t\"LaunchOptions\"\t\t\"{}\"{eol}",
+        vdf_escape(opts)
+    );
+
+    let mut out = String::with_capacity(content.len() + new_line.len());
+    for (j, l) in lines.iter().enumerate() {
+        if Some(j) == existing {
+            if !opts.is_empty() {
+                out.push_str(&new_line);
+            }
+            continue;
+        }
+        out.push_str(l);
+        if existing.is_none() && j == open && !opts.is_empty() {
+            out.push_str(&new_line);
+        }
+    }
+    Some(out)
+}
+
+/// Writes `opts` as the Steam `LaunchOptions` of an official game, in every active user's
+/// `localconfig.vdf`. Refuses while the game or Steam runs: Steam holds this file in memory and
+/// rewrites it, so an edit made now would be lost or could corrupt the file.
+pub fn write_steam_localconfig_launch_options(
+    appid: u32,
+    name: &str,
+    opts: &str,
+) -> crate::error::VapourResult<()> {
+    use crate::error::VapourError;
+    ensure_game_not_running(appid, name)?;
+    if crate::launcher::is_steam_running() {
+        return Err(VapourError::Runtime(
+            "Steam is running and rewrites localconfig.vdf on exit, which would undo this change. \
+             Quit Steam (vapour shutdown) and try again."
+                .into(),
+        ));
+    }
+    let mut written = 0;
+    for user_dir in crate::non_steam::get_active_user_data_dirs() {
+        let path = user_dir.join("config/localconfig.vdf");
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(updated) = set_localconfig_launch_options(&content, appid, opts) else {
+            continue;
+        };
+        let backup = path.with_extension("vdf.vapour.bak");
+        if !backup.exists() {
+            let _ = fs::copy(&path, &backup);
+        }
+        crate::non_steam::write_atomic(&path, updated.as_bytes())?;
+        written += 1;
+    }
+    if written == 0 {
+        return Err(VapourError::Runtime(format!(
+            "localconfig.vdf has no entry for '{name}' yet. Launch it once from Steam, then retry."
+        )));
+    }
+    Ok(())
+}
+
+/// Errors when the game's processes are alive. Launch options are read at launch, so a change made
+/// mid-session would be misleading, and for official games the file is Steam's.
+pub fn ensure_game_not_running(appid: u32, name: &str) -> crate::error::VapourResult<()> {
+    if crate::session::find_game_pids(appid).is_empty() {
+        Ok(())
+    } else {
+        Err(crate::error::VapourError::Runtime(format!(
+            "'{name}' is running. Quit the game before changing its launch options."
+        )))
+    }
+}
+
 /// Parses localconfig.vdf text content and extracts the native Steam LaunchOptions for a given AppID.
 pub fn parse_localconfig_launch_options(content: &str, appid: u32) -> Option<String> {
     let target_app = format!("\"{}\"", appid);
@@ -707,10 +888,8 @@ pub fn parse_localconfig_launch_options(content: &str, appid: u32) -> Option<Str
                 continue;
             }
 
-            if trimmed.starts_with("\"LaunchOptions\"") {
-                let parts: Vec<&str> = trimmed.split('"').collect();
-                if parts.len() >= 4 {
-                    let val = parts[3].trim().to_string();
+            if target_depth == 1 {
+                if let Some(val) = vdf_launch_options_value(trimmed) {
                     if !val.is_empty() {
                         return Some(val);
                     }
@@ -811,6 +990,59 @@ mod tests {
         assert_eq!(entries[1].apps, vec![730, 480]);
     }
 
+    const LOCALCONFIG: &str = "\"UserLocalConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"apps\"\n\t\t\t\t{\n\t\t\t\t\t\"730\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LastPlayed\"\t\t\"1\"\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"gamescope -f -- %command%\"\n\t\t\t\t\t\t\"cloud\"\n\t\t\t\t\t\t{\n\t\t\t\t\t\t\t\"LaunchOptions\"\t\t\"nested\"\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t\t\"550\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LastPlayed\"\t\t\"2\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n";
+
+    #[test]
+    fn set_localconfig_should_replace_existing_line_only() {
+        let out =
+            set_localconfig_launch_options(LOCALCONFIG, 730, "mangohud %command% -novid").unwrap();
+        assert_eq!(
+            parse_localconfig_launch_options(&out, 730).as_deref(),
+            Some("mangohud %command% -novid")
+        );
+        assert!(
+            out.contains("\"nested\""),
+            "nested block must stay untouched"
+        );
+        assert_eq!(parse_localconfig_launch_options(&out, 550), None);
+        assert_eq!(out.lines().count(), LOCALCONFIG.lines().count());
+    }
+
+    #[test]
+    fn set_localconfig_should_insert_when_absent_and_remove_when_empty() {
+        let out = set_localconfig_launch_options(LOCALCONFIG, 550, "-novid").unwrap();
+        assert_eq!(
+            parse_localconfig_launch_options(&out, 550).as_deref(),
+            Some("-novid")
+        );
+        assert_eq!(
+            parse_localconfig_launch_options(&out, 730).as_deref(),
+            Some("gamescope -f -- %command%")
+        );
+        let cleared = set_localconfig_launch_options(&out, 550, "").unwrap();
+        assert_eq!(cleared, LOCALCONFIG);
+        let cleared730 = set_localconfig_launch_options(LOCALCONFIG, 730, "").unwrap();
+        assert_eq!(parse_localconfig_launch_options(&cleared730, 730), None);
+    }
+
+    #[test]
+    fn set_localconfig_should_return_none_for_unknown_app() {
+        assert_eq!(
+            set_localconfig_launch_options(LOCALCONFIG, 9999, "-x"),
+            None
+        );
+    }
+
+    #[test]
+    fn localconfig_should_round_trip_quotes_and_backslashes() {
+        let opts = r#"WINEDLLOVERRIDES="winhttp=n,b" PATH=C:\x %command%"#;
+        let out = set_localconfig_launch_options(LOCALCONFIG, 730, opts).unwrap();
+        assert_eq!(
+            parse_localconfig_launch_options(&out, 730).as_deref(),
+            Some(opts)
+        );
+    }
+
     #[test]
     fn test_parse_localconfig_launch_options() {
         let sample = r#"
@@ -845,14 +1077,6 @@ mod tests {
         );
         assert_eq!(parse_localconfig_launch_options(sample, 550), None);
         assert_eq!(parse_localconfig_launch_options(sample, 9999), None);
-    }
-
-    #[test]
-    fn test_live_localconfig_read_cs2() {
-        if let Some(opts) = get_steam_localconfig_launch_options(730) {
-            assert!(opts.contains("gamemoderun"));
-            assert!(opts.contains("gamescope"));
-        }
     }
 
     #[test]

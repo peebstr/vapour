@@ -118,7 +118,7 @@ pub struct Cli {
     #[arg(long = "set-path", num_args = 2, value_names = ["GAME", "NEW_PATH"])]
     pub set_path: Option<Vec<String>>,
 
-    /// Set or update Steam Launch Options for a Non-Steam game: --set-launch-options <GAME> <OPTIONS>
+    /// Replace a game's launch options (Steam games via localconfig.vdf, non-Steam via shortcuts.vdf): --set-launch-options <GAME> <OPTIONS>
     #[arg(long = "set-launch-options", alias = "set-opts", num_args = 2, value_names = ["GAME", "OPTIONS"], allow_hyphen_values = true)]
     pub set_launch_options: Option<Vec<String>>,
 
@@ -627,6 +627,8 @@ pub fn run() -> VapourResult<()> {
         let _ = std::io::stdout().flush();
         default_hook(info);
     }));
+
+    crate::launcher::adopt_session_env();
 
     let raw_args: Vec<String> = std::env::args().collect();
     let normalized_args: Vec<String> = raw_args

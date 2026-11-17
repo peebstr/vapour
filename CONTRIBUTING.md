@@ -191,7 +191,7 @@ Use the constants defined in `src/error.rs` (`EXIT_SUCCESS`, `EXIT_RUNTIME_ERR`,
 ### 10. Modular Game Runner Trait & Wrapper Pipeline
 - All process dispatch routines belong in [`src/runner.rs`](src/runner.rs) under the `GameRunner` trait (`name`, `build_command`, `launch`).
 - Never write ad-hoc `Command::new` spawners inside CLI handling loops. Dispatch targets through `get_runner_for_target`.
-- Compose wrappers exclusively through `compose_command_tokens`, preserving first-class flags (`gamemoderun`, `mangohud`, `gamescope`) and Steam `%command%` expansion.
+- Compose wrappers exclusively through `compose_command_tokens`, preserving Steam `%command%` expansion. Wrappers come only from launch options; there are no wrapper toggles.
 - Respect the 4-tier configuration precedence: CLI > `settings.toml` per-game > `settings.toml` defaults > `localconfig.vdf`.
 
 ### 11. Typed Error Architecture & Property-Based Testing

@@ -9,7 +9,7 @@ A Steam launcher and lifecycle manager for Linux. It runs Steam without its desk
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20(systemd%20%2B%20cgroup%20v2)-lightgrey.svg)](https://www.kernel.org/)
 
-> **Alpha.** Vapour has only been run on one machine (CachyOS, kernel 7.3, Hyprland). It starts and stops Steam, kills leftover Steam helper processes (`vapour prune`), and edits `shortcuts.vdf`, `config.vdf` and `appmanifest_*.acf`. Back up `~/.local/share/Steam/userdata` before trying it. See [Known limitations](#known-limitations).
+> **Alpha.** Vapour has only been run on one machine (CachyOS, kernel 7.3, Hyprland). It starts and stops Steam, kills leftover Steam helper processes (`vapour prune`), and edits `shortcuts.vdf`, `config.vdf`, `localconfig.vdf` (launch options) and `appmanifest_*.acf`. Back up `~/.local/share/Steam/userdata` before trying it. See [Known limitations](#known-limitations).
 
 ## Why
 
@@ -18,7 +18,7 @@ Steam's desktop client keeps several Chromium (CEF) processes resident while a g
 ## How it works
 
 - **Headless Steam.** If Steam isn't running, Vapour starts it with `-silent` and a few flags that disable UI subsystems, inside its own systemd scope (`systemd-run --user --scope -p Delegate=yes --unit=vapour-steam-<pid>`). Games launch through Steam's normal path (`-applaunch` / `-gameidlaunch`).
-- **Memory reclaim.** Vapour writes `1500M swappiness=200` to `memory.reclaim` in Steam's cgroups. On kernels before 6.11 it writes plain `1500M`. The CLI does this at T+12 s and T+40 s, the daemon at T+0 and T+25 s. Further passes run when a kernel PSI trigger reports memory pressure. These timings are empirical defaults.
+- **Memory reclaim.** Vapour writes `1500M swappiness=200` (the `[daemon]` defaults `reclaim_bytes_mb` and `swappiness`) to `memory.reclaim` in Steam's cgroups. On kernels before 6.11 it writes plain `1500M`. It skips the cgroups of the game and of wrappers such as gamescope that sit between Steam and the game. The CLI does this at T+12 s and T+40 s, the daemon at T+0 and T+25 s. Further passes run when a kernel PSI trigger reports memory pressure. These timings are empirical defaults.
 - **The game is never touched.** `STEAM_LAUNCH_WRAPPER_SCOPE=1` makes Steam put each game in its own `app-steam-app<appid>-*.scope`, and Vapour never writes to that scope.
 - **Exit and cloud sync.** Game exit is detected from the scope's `cgroup.events`, with pidfd and `/proc` polling as fallbacks. Before shutting Steam down, Vapour waits for that game's `Upload complete` line in `cloud_log.txt`.
 - **Ownership.** Vapour only ever shuts down a Steam it started itself. A Steam you started is left running; if the daemon closed its window, it reopens it.
@@ -68,7 +68,7 @@ bind = $mainMod, G, exec, vapour list --dmenu | rofi -dmenu -i -p Steam | cut -d
 ```bash
 vapour add "Game" /path/to/Game.exe --compat "Proton Experimental" --launch-options "-novid"
 vapour compat 730 GE-Proton9-23      # set the Proton version for a game
-vapour --set-launch-options "Game" "gamemoderun %command% -novid"
+vapour --set-launch-options "Game" "gamemoderun %command% -novid"   # also works for Steam games
 vapour rm "Game" --yes               # removes the shortcut and its Proton prefix
 vapour "Game" --direct               # run through Proton without starting Steam
 ```
@@ -108,14 +108,14 @@ The daemon watches `app.slice` with inotify for new game scopes, then reclaims m
 | `vapour compat <GAME> [TOOL]` | `--compat` | Show or set the Proton version |
 | `vapour list [--json\|--dmenu\|--plain] [--sort recent\|size\|name]` | `-l` | List games |
 | `vapour libraries [--add P] [--del P]` | `--libraries` | Manage library folders |
-| `vapour config [KEY=VAL] [--get KEY]` | `-c` | Edit settings (interactive without arguments) |
+| `vapour config [KEY=VAL] [--get KEY]` | `-c`, `--set KEY=VAL` | Edit settings (interactive without arguments); keys: `overlay`, `zero_ram`, `nojoy` |
 | `vapour info <GAME> [--json]` | `-i` | Show a game's runtime and configuration |
 | `vapour doctor [--json] [--deep]` | `--doctor` | Check the system |
-| `vapour status [--watch] [--json]` | `-s` | Steam state |
+| `vapour status [--watch] [--interval S] [--json]` | `-s` | Steam state |
 | `vapour monitor` | `-m` | Live HUD |
 | `vapour reclaim` | `--reclaim` | Reclaim once |
 | `vapour shutdown` / `kill` | `-k` | Shut Steam down gracefully |
-| `vapour prune` / `clean` | `--prune` | Clean up leftovers |
+| `vapour prune` / `clean` [`--dry-run`] [`--compat-only`\|`--shader-only`\|`--shm-only`\|`--proc-only`] | `--prune` | Clean up leftovers |
 | `vapour desktop-entries` | | Generate `.desktop` files |
 | `vapour daemon` | | Background supervisor |
 | `vapour completions <SHELL>` | `--completions` | Shell completions |
@@ -133,16 +133,11 @@ Launch settings resolve in this order: CLI flags, then `[games.<id>]`, then `[de
 overlay = true         # Steam overlay; false suppresses it
 zero_ram = true        # headless Steam flags and memory reclaim
 nojoy = false          # pass -nojoy
-gamemode = false
-mangohud = false
-gamescope = false
-gamescope_args = "-W 1920 -H 1080 -f"
-wrapper = ""           # supports %command%
 
 [games.730]
-mangohud = true
-extra_args = ["-novid"]
-env = [["MESA_VK_WSI_PRESENT_MODE", "mailbox"]]
+extra_args = "-novid"                        # space separated
+env = "MESA_VK_WSI_PRESENT_MODE=mailbox"     # KEY=VAL pairs separated by ";"
+wrapper = "gamemoderun %command%"            # supports %command%
 
 [games."Some Game"]
 compat_tool = "Proton Experimental"
@@ -153,6 +148,8 @@ launch_options = "WINEDLLOVERRIDES=\"winhttp=n,b\" gamemoderun %command% -fullsc
 [daemon]
 auto_tray_gui = true          # close a user-started Steam's window to the tray on game start
 restore_gui_on_exit = true    # reopen it after the game exits
+reclaim_bytes_mb = 1500       # size of each memory.reclaim request
+swappiness = 200              # swappiness= bias for it (kernel 6.11+)
 psi_adaptive = true           # extra reclaim passes under memory pressure
 notifications = true
 shutdown_if_headless = true   # shut down a Steam the daemon's session owns
@@ -160,7 +157,9 @@ shutdown_if_headless = true   # shut down a Steam the daemon's session owns
 
 `launch_options` follows Steam's rules. Leading `KEY=VAL` tokens become environment variables, the other tokens before `%command%` become wrappers, and tokens after it become game arguments. Without `%command%`, everything is a game argument. If Steam is already running, a Steam-dispatched launch can't apply env or wrapper settings; Vapour warns, and you set those in Steam instead.
 
-Wrappers chain as `custom → gamemoderun → mangohud → gamescope <args> -- → game`, unless `wrapper` contains `%command%`, in which case it is used as written.
+There are no `gamemode`, `mangohud` or `gamescope` switches. Put wrappers in the launch options (`gamemoderun gamescope -f -- %command%`). Old `gamemode`, `mangohud`, `gamescope` and `gamescope_args` keys are ignored and dropped the next time Vapour saves the file.
+
+For a Steam game, `vapour --set-launch-options` and the `vapour config` menu show the current launch options from Steam's `localconfig.vdf` and replace them with what you type. Vapour refuses the change while the game is running. It also refuses while Steam is running, because Steam rewrites that file when it exits and would undo the edit; run `vapour shutdown` first. The first write saves a copy as `localconfig.vdf.vapour.bak`. A game Steam has never launched has no entry in the file, so launch it once from Steam first.
 
 ## Anti-cheat
 
@@ -170,8 +169,8 @@ Vapour never attaches to, reads from or signals a game process, and never writes
 
 - Only tested on one machine. Kernels 5.19 to 6.10, other distros, GNOME/KDE and Steam Deck are untested.
 - Steam behaviour is undocumented by Valve. Launch flags, log formats and scope names were checked against the client installed on 2026-11-16, and can change with any Steam update. `vapour doctor --deep` catches removed flags.
-- The cloud-conflict check matches marker words that have never been seen in a real log, so it may not fire.
-- Not yet exercised with Steam running: the X11 window handling, exit detection via `cgroup.events`, and PSI-trigger passes.
+- The cloud-conflict check matches marker words that have never been seen in a real log, so it may not fire. When it fires, or an exit sync starts and never completes, the raw lines for that game are saved to `~/.cache/vapour/cloud_unknown.log`; attach them to a bug report.
+- Run live only for CLI launches of one game (CS2, with and without gamescope): reclaim passes, exit detection and the Steam shutdown. Not yet exercised with Steam running: the daemon, the X11 window handling, PSI-trigger passes and the Cloud exit-sync wait.
 - The reclaim timings and the 5 % PSI threshold are guesses that haven't been tuned across games.
 
 ## Development

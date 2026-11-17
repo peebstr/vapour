@@ -11,7 +11,8 @@ use serde::Serialize;
 use crate::launcher::{get_steam_pid, get_steamwebhelper_pids, is_steam_running, shutdown_steam};
 use crate::library::format_bytes;
 use crate::watcher::{
-    find_steam_cgroup_dirs, read_memory_pressure, reclaim_steam_memory, MemoryPressure,
+    game_wrapper_rss_bytes, read_memory_pressure, reclaim_steam_memory,
+    steam_cgroup_dirs_unfiltered, MemoryPressure,
 };
 
 pub const SPARKLINE_BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -75,6 +76,8 @@ pub struct ZramInfo {
 /// Point-in-time telemetry snapshot of Steam daemon, CEF webhelpers, and game isolation.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct TelemetrySnapshot {
+    /// Estimated RSS of game wrappers (gamescope, Xwayland, ...) already subtracted from the Steam totals.
+    pub wrapper_rss_bytes: u64,
     pub timestamp_epoch_secs: u64,
     pub steam_running: bool,
     pub steam_pid: Option<u32>,
@@ -241,7 +244,7 @@ pub fn collect_telemetry_snapshot() -> TelemetrySnapshot {
     let webhelper_pids = get_steamwebhelper_pids();
 
     let mut cgroup_scopes = Vec::new();
-    let cg_dirs = find_steam_cgroup_dirs();
+    let cg_dirs = steam_cgroup_dirs_unfiltered();
     let mut cgroup_total_rss = 0u64;
     let mut cgroup_total_swap = 0u64;
     let mut cgroup_total_peak = 0u64;
@@ -329,11 +332,23 @@ pub fn collect_telemetry_snapshot() -> TelemetrySnapshot {
         total_rss_bytes
     };
 
+    // Wrappers such as gamescope share `vapour-steam-*.scope` with Steam but are the game's, not Steam's.
+    // Only the cgroup path is affected: the /proc fallback sums Steam processes only.
+    let wrapper_rss_bytes = if cgroup_total_rss > 0 {
+        game_wrapper_rss_bytes().min(steam_rss_bytes)
+    } else {
+        0
+    };
+    let steam_rss_bytes = steam_rss_bytes - wrapper_rss_bytes;
+    let total_rss_bytes = total_rss_bytes - wrapper_rss_bytes;
+    let total_peak_bytes = total_peak_bytes.saturating_sub(wrapper_rss_bytes);
+
     let game_container = find_game_cgroup_scope();
     let psi = read_memory_pressure();
     let zram = read_zram_info();
 
     TelemetrySnapshot {
+        wrapper_rss_bytes,
         timestamp_epoch_secs: epoch_secs,
         steam_running,
         steam_pid,
@@ -350,6 +365,24 @@ pub fn collect_telemetry_snapshot() -> TelemetrySnapshot {
         psi,
         zram,
     }
+}
+
+/// RAM actually saved: what left the scopes (`peak - current`) minus the compressed copy of the
+/// swapped part that zRAM keeps in RAM. `ratio` is the zRAM compression ratio (1.0 for disk swap).
+pub fn net_saved_bytes(peak: u64, current: u64, swap: u64, ratio: f64) -> u64 {
+    let gross = peak.saturating_sub(current);
+    let compressed = (swap as f64 / ratio.max(1.0)) as u64;
+    gross.saturating_sub(compressed)
+}
+
+fn snapshot_net_saved(s: &TelemetrySnapshot) -> u64 {
+    let ratio = s.zram.as_ref().map_or(1.0, |z| z.compression_ratio);
+    net_saved_bytes(
+        s.total_peak_bytes,
+        s.total_rss_bytes,
+        s.total_swap_bytes,
+        ratio,
+    )
 }
 
 /// Prints a rich diagnostic snapshot for `vapour status`.
@@ -380,9 +413,7 @@ pub fn print_telemetry_snapshot_rich(snapshot: &TelemetrySnapshot) {
     );
     let peak_note =
         if snapshot.total_peak_bytes > snapshot.total_rss_bytes && snapshot.total_rss_bytes > 0 {
-            let saved = snapshot
-                .total_peak_bytes
-                .saturating_sub(snapshot.total_rss_bytes);
+            let saved = snapshot_net_saved(snapshot);
             format!(
                 " (Peak: {}, Saved: {})",
                 format_bytes(snapshot.total_peak_bytes),
@@ -433,6 +464,13 @@ pub fn print_telemetry_snapshot_rich(snapshot: &TelemetrySnapshot) {
         );
     } else {
         println!("  Game Container: None active (Steam daemon in idle background standby)");
+    }
+
+    if snapshot.wrapper_rss_bytes > 0 {
+        println!(
+            "  Game wrappers: ~{} (gamescope etc., in a Steam scope, excluded from the totals above)",
+            format_bytes(snapshot.wrapper_rss_bytes)
+        );
     }
 
     if !snapshot.cgroup_scopes.is_empty() {
@@ -611,11 +649,7 @@ pub fn run_telemetry_hud(mut interval: Duration, max_iterations: Option<usize>) 
             format!(
                 "{}/-{}",
                 format_bytes(snapshot.total_peak_bytes),
-                format_bytes(
-                    snapshot
-                        .total_peak_bytes
-                        .saturating_sub(snapshot.total_rss_bytes)
-                )
+                format_bytes(snapshot_net_saved(&snapshot))
             )
         } else {
             format_bytes(snapshot.total_peak_bytes)
@@ -663,6 +697,14 @@ pub fn run_telemetry_hud(mut interval: Duration, max_iterations: Option<usize>) 
                 );
                 println!("│   {:<74} │", scope_line);
             }
+        }
+
+        if snapshot.wrapper_rss_bytes > 0 {
+            let wl = format!(
+                "~ game wrappers: ~{} (in a Steam scope, not in the totals)",
+                format_bytes(snapshot.wrapper_rss_bytes)
+            );
+            println!("│   {:<74} │", wl);
         }
 
         if let Some(ref game) = snapshot.game_container {
@@ -769,6 +811,15 @@ pub fn run_telemetry_hud(mut interval: Duration, max_iterations: Option<usize>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_saved_should_subtract_compressed_zram_copy() {
+        // 810 MB peak, 106 MB now, 631 MB swapped at 4x: 704 - 157 = 547 MB
+        let mb = 1024 * 1024;
+        assert_eq!(net_saved_bytes(810 * mb, 106 * mb, 632 * mb, 4.0), 546 * mb);
+        assert_eq!(net_saved_bytes(100, 200, 0, 1.0), 0);
+        assert_eq!(net_saved_bytes(1000, 100, 5000, 1.0), 0);
+    }
 
     #[test]
     fn test_render_sparkline_empty() {

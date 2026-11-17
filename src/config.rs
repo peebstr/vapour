@@ -15,14 +15,6 @@ pub struct GlobalSettings {
     pub zero_ram: bool,
     #[serde(default = "default_false")]
     pub nojoy: bool,
-    #[serde(default = "default_false")]
-    pub gamemode: bool,
-    #[serde(default = "default_false")]
-    pub mangohud: bool,
-    #[serde(default = "default_false")]
-    pub gamescope: bool,
-    #[serde(default)]
-    pub gamescope_args: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -39,10 +31,6 @@ impl Default for GlobalSettings {
             overlay: true,
             zero_ram: true,
             nojoy: false,
-            gamemode: false,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
         }
     }
 }
@@ -52,10 +40,6 @@ pub struct GameConfig {
     pub overlay: Option<bool>,
     pub extra_args: Vec<String>,
     pub wrapper: Option<String>,
-    pub gamemode: Option<bool>,
-    pub mangohud: Option<bool>,
-    pub gamescope: Option<bool>,
-    pub gamescope_args: Option<String>,
     pub env: Vec<(String, String)>,
     pub exe_path: Option<PathBuf>,
     pub start_dir: Option<PathBuf>,
@@ -71,14 +55,6 @@ struct GameConfigToml {
     pub extra_args: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapper: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gamemode: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mangohud: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gamescope: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gamescope_args: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,10 +87,6 @@ impl From<GameConfigToml> for GameConfig {
             overlay: t.overlay,
             extra_args,
             wrapper: t.wrapper,
-            gamemode: t.gamemode,
-            mangohud: t.mangohud,
-            gamescope: t.gamescope,
-            gamescope_args: t.gamescope_args,
             env,
             exe_path: t.exe_path,
             start_dir: t.start_dir,
@@ -148,10 +120,6 @@ impl From<&GameConfig> for GameConfigToml {
             overlay: g.overlay,
             extra_args,
             wrapper: g.wrapper.clone(),
-            gamemode: g.gamemode,
-            mangohud: g.mangohud,
-            gamescope: g.gamescope,
-            gamescope_args: g.gamescope_args.clone(),
             env,
             exe_path: g.exe_path.clone(),
             start_dir: g.start_dir.clone(),
@@ -166,10 +134,6 @@ pub struct ResolvedLaunchConfig {
     pub overlay: bool,
     pub keep_steam: bool,
     pub nojoy: bool,
-    pub gamemode: bool,
-    pub mangohud: bool,
-    pub gamescope: bool,
-    pub gamescope_args: Option<String>,
     pub wrapper: Option<String>,
     pub env: Vec<(String, String)>,
     pub extra_args: Vec<String>,
@@ -346,13 +310,6 @@ impl VapourConfig {
         let overlay = self.resolve_overlay(id_or_name, cli_overlay);
         let keep_steam = self.resolve_keep_steam(cli_keep_steam);
 
-        let gamemode = game_cfg.gamemode.unwrap_or(self.defaults.gamemode);
-        let mangohud = game_cfg.mangohud.unwrap_or(self.defaults.mangohud);
-        let gamescope = game_cfg.gamescope.unwrap_or(self.defaults.gamescope);
-        let gamescope_args = game_cfg
-            .gamescope_args
-            .clone()
-            .or_else(|| self.defaults.gamescope_args.clone());
         let mut wrapper = game_cfg.wrapper.clone();
         let mut env = game_cfg.env.clone();
 
@@ -385,10 +342,6 @@ impl VapourConfig {
             overlay,
             keep_steam,
             nojoy: self.defaults.nojoy,
-            gamemode,
-            mangohud,
-            gamescope,
-            gamescope_args,
             wrapper,
             env,
             extra_args,
@@ -552,6 +505,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn readme_config_example_should_parse() {
+        let readme = include_str!("../README.md");
+        let block = readme
+            .split("```toml\n")
+            .nth(1)
+            .and_then(|r| r.split("```").next())
+            .expect("README has a toml block");
+        let cfg = VapourConfig::parse(block).expect("README example must parse");
+        assert_eq!(cfg.get_game_config("730").extra_args, vec!["-novid"]);
+        assert_eq!(cfg.get_game_config("730").env.len(), 1);
+        assert_eq!(cfg.daemon.reclaim_bytes_mb, 1500);
+    }
+
+    #[test]
     fn test_parse_and_serialize() {
         let input = r#"
 [defaults]
@@ -675,8 +642,7 @@ wrapper = "custom-wrapper"
 
         assert!(!resolved.overlay); // CLI override
         assert!(resolved.keep_steam); // CLI override
-        assert!(resolved.gamemode); // From defaults
-        assert!(resolved.mangohud); // From game override
+                                      // The removed gamemode/mangohud/gamescope keys in the TOML above must still parse (ignored).
         assert_eq!(resolved.wrapper, Some("custom-wrapper".to_string()));
         assert_eq!(resolved.extra_args, vec!["-freq", "240", "-novid"]);
     }

@@ -44,8 +44,8 @@ flowchart TD
     AppSlice --> GameScope["app-steam-app730-*.scope\n(game: Counter-Strike 2)"]
 
     ReclaimEngine["Reclaim engine\n(src/session.rs)"]
-    ReclaimEngine -->|"memory.reclaim (1500M)"| CoreDaemon
-    ReclaimEngine -->|"memory.reclaim (1500M)"| CEFHelper
+    ReclaimEngine -->|"memory.reclaim (reclaim_bytes_mb)"| CoreDaemon
+    ReclaimEngine -->|"memory.reclaim (reclaim_bytes_mb)"| CEFHelper
     ReclaimEngine -.->|"never written"| GameScope
 ```
 
@@ -57,7 +57,7 @@ systemd documents that you should only write attributes of cgroups delegated to 
 
 ### The reclaim request
 
-Vapour writes `1500M swappiness=200\n` `[design: src/session.rs write_reclaim_request]`.
+Vapour writes `<reclaim_bytes_mb>M swappiness=<swappiness>\n`, by default `1500M swappiness=200\n` `[design: src/session.rs write_reclaim_request]`.
 
 - `swappiness=` in `memory.reclaim` exists from Linux 6.11 `[spec: cgroup-v2]`. On older kernels the first write returns `EINVAL` (inferred from the kernel source, not tested on 5.19-6.10); Vapour then remembers that and writes plain `1500M\n` for the rest of the process `[design: SWAPPINESS_STATE]`.
 - Reclaim scans both anonymous and file LRUs. Only `swappiness=max` (6.16) is documented as anon-only `[spec: cgroup-v2]`; Vapour does not use it yet.
@@ -87,6 +87,7 @@ Vapour writes `1500M swappiness=200\n` `[design: src/session.rs write_reclaim_re
 1. Scan `app.slice` for `vapour-steam-*.scope` and `app-steam-unknown-*.scope` that expose `memory.reclaim`.
 2. Add the cgroup of the `steam` PID and every `steamwebhelper` PID, read from `/proc/<pid>/cgroup`.
 3. Drop any directory whose **leaf name** starts with `app-steam-app` (ancestor directories are not inspected).
+3a. Drop any directory that holds a process between `steam` and a game process (for example `gamescope` and its Xwayland, which a launch option can put in `vapour-steam-*.scope`). `memory.reclaim` works per cgroup, so these are skipped whole. Telemetry uses the unfiltered list and subtracts the estimated RSS of user wrappers (gamescope and its children; Steam's own launcher processes are not counted as wrappers) from the Steam totals, shown on a separate "game wrappers" line.
 4. Deduplicate and write the reclaim request to each.
 
 ---
@@ -100,7 +101,7 @@ sequenceDiagram
     participant Cgroup as Steam Cgroups
 
     Note over Vapour,Cgroup: scheduled passes (CLI: T+12s, T+40s; daemon: T+0, T+25s)
-    Vapour->>Cgroup: write "1500M swappiness=200" to memory.reclaim
+    Vapour->>Cgroup: write "<reclaim_bytes_mb>M swappiness=<swappiness>" to memory.reclaim
     Vapour->>Kernel: register PSI trigger "some 300000 2000000"
     Kernel-->>Vapour: POLLPRI when tasks stalled 300 ms within 2 s
     Vapour->>Cgroup: reactive reclaim pass (cap and cooldown per driver)
@@ -193,7 +194,7 @@ Exit detection, in order `[design: src/session.rs GameSession::run]`:
 | On exit | shut down a vapour-started Steam unless `--keep-steam` | `Owned` + `shutdown_if_headless`: shut down; `Adopted` with a GUI that was open + `restore_gui_on_exit`: restore it |
 | Yields when | never (Ctrl+C detaches) | a CLI session lock for the AppID exists (checked every wake-up) or the daemon is stopping |
 
-`Owned` means the Steam process lives in a `vapour-steam-*.scope`; a user's own `steam -silent` (e.g. tray autostart) is `Adopted` and never shut down.
+`Owned` means a populated `vapour-steam-*.scope` exists (the `steam` PID in `steam.pid` runs inside the pressure-vessel container, in an `app-steam-unknown-*.scope`); a user's own `steam -silent` (e.g. tray autostart) is `Adopted` and never shut down.
 
 ### Telemetry parsing
 
@@ -255,7 +256,7 @@ None of these are kernel or Steam facts.
 
 | Constant | Value | Where |
 | :--- | :--- | :--- |
-| Reclaim size | 1500M | `write_reclaim_request` in `src/session.rs` |
+| Reclaim size | 1500M (`[daemon] reclaim_bytes_mb`) | `write_reclaim_request` in `src/session.rs` |
 | CLI scheduled passes | T+12 s, T+40 s | `CLI_RECLAIM_AT` in `src/watcher.rs` |
 | Daemon scheduled passes | T+0, T+25 s | `DAEMON_RECLAIM_AT` in `src/daemon.rs` |
 | PSI trigger | 300 ms stall in a 2 s window | `PsiTrigger::open` in `src/session.rs` |

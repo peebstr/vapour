@@ -53,7 +53,7 @@ pub struct LaunchResult {
 
 /// Composes wrapper tokens around an executable and its argument list.
 /// Supports Steam's %command% expansion or standard wrapper chaining:
-/// [custom wrapper] -> [gamemoderun] -> [mangohud] -> [gamescope <args> --] -> <executable> <args>
+/// [wrapper tokens from launch options] -> <executable> <args>
 pub fn compose_command_tokens(
     base_bin: &Path,
     game_args: &[String],
@@ -84,30 +84,26 @@ pub fn compose_command_tokens(
         }
     }
 
-    if config.gamemode && !prefix.iter().any(|t| t == "gamemoderun") {
-        prefix.push("gamemoderun".to_string());
-    }
-
-    if config.mangohud && !prefix.iter().any(|t| t == "mangohud") {
-        prefix.push("mangohud".to_string());
-    }
-
-    if config.gamescope && !prefix.iter().any(|t| t == "gamescope") {
-        prefix.push("gamescope".to_string());
-        if let Some(ref ga) = config.gamescope_args {
-            for arg in ga.split_whitespace() {
-                prefix.push(arg.to_string());
-            }
-        }
-        prefix.push("--".to_string());
-    }
-
     prefix.push(bin_str);
     prefix.extend_from_slice(game_args);
 
     let exe = prefix[0].clone();
     let args = prefix[1..].to_vec();
     (exe, args)
+}
+
+/// Dry-run lines for the memory plan, built from the real config instead of fixed text.
+fn print_memory_plan(appid: u32) {
+    let d = crate::config::VapourConfig::load_checked()
+        .map(|c| c.daemon)
+        .unwrap_or_default();
+    println!("          Reclaim Targets:   vapour-steam-*.scope, app-steam-unknown-*.scope");
+    println!("                             (cgroups holding game wrappers such as gamescope are skipped)");
+    println!("          Protected Scope:   app-steam-app{appid}-*.scope (game, never written)");
+    println!(
+        "          Memory Policy:     memory.reclaim {}M swappiness={} @ T+12s, T+40s, PSI-triggered",
+        d.reclaim_bytes_mb, d.swappiness
+    );
 }
 
 /// Core abstraction for game runners.
@@ -216,26 +212,14 @@ impl GameRunner for SteamDaemonRunner {
                 config.extra_args.join(" ")
             );
             println!("          Steam Pre-existing: {}", was_running);
-            println!(
-                "          Target Cgroup:     app-steam-unknown-*.scope (Daemon & CEF evictable)"
-            );
-            println!(
-                "          Protected Scope:   app-steam-app{}-*.scope (Game Container)",
-                appid
-            );
-            println!(
-                "          Memory Policy:     cgroups v2 (swappiness=200 @ T+12s, T+40s, PSI elevated)"
-            );
+            print_memory_plan(appid);
             if config.overlay {
                 println!("          Overlay:           ENABLED (Available in-game)");
             } else {
                 println!("          Overlay:           SUPPRESSED");
             }
-            if config.gamemode || config.mangohud || config.gamescope || config.wrapper.is_some() {
-                println!(
-                    "          Wrappers:          gamemode={}, mangohud={}, gamescope={}, custom={:?}",
-                    config.gamemode, config.mangohud, config.gamescope, config.wrapper
-                );
+            if let Some(ref w) = config.wrapper {
+                println!("          Wrapper:           {}", w);
             }
             if let Some(ref lo) = config.localconfig_options {
                 println!("          Localconfig Opts:  \"{}\"", lo);
@@ -374,26 +358,14 @@ impl GameRunner for SteamShortcutRunner {
                 config.cli_args.join(" ")
             );
             println!("          Steam Pre-existing: {}", was_running);
-            println!(
-                "          Target Cgroup:     app-steam-unknown-*.scope (Daemon & CEF evictable)"
-            );
-            println!(
-                "          Protected Scope:   app-steam-app{}-*.scope (Game Container)",
-                appid_32
-            );
-            println!(
-                "          Memory Policy:     cgroups v2 (swappiness=200 @ T+12s, T+40s, PSI elevated)"
-            );
+            print_memory_plan(appid_32);
             if config.overlay {
                 println!("          Overlay:           ENABLED (Available in shortcut)");
             } else {
                 println!("          Overlay:           SUPPRESSED");
             }
-            if config.gamemode || config.mangohud || config.gamescope || config.wrapper.is_some() {
-                println!(
-                    "          Wrappers:          gamemode={}, mangohud={}, gamescope={}, custom={:?}",
-                    config.gamemode, config.mangohud, config.gamescope, config.wrapper
-                );
+            if let Some(ref w) = config.wrapper {
+                println!("          Wrapper:           {}", w);
             }
             if !config.env.is_empty() {
                 let env_str = config
@@ -571,11 +543,8 @@ impl GameRunner for ProtonDirectRunner {
             println!("          AppID: {}", game.appid);
             let prefix_dir = get_compat_data_path_for_appid(game.appid);
             println!("          Prefix (compatdata): {}", prefix_dir.display());
-            if config.gamemode || config.mangohud || config.gamescope || config.wrapper.is_some() {
-                println!(
-                    "          Wrappers: gamemode={}, mangohud={}, gamescope={}, custom={:?}",
-                    config.gamemode, config.mangohud, config.gamescope, config.wrapper
-                );
+            if let Some(ref w) = config.wrapper {
+                println!("          Wrapper:           {}", w);
             }
             return Ok(LaunchResult {
                 appid: game.appid,
@@ -681,11 +650,8 @@ impl GameRunner for NativeDirectRunner {
             );
             println!("          Executable: {:?}", cmd);
             println!("          AppID: {}", game.appid);
-            if config.gamemode || config.mangohud || config.gamescope || config.wrapper.is_some() {
-                println!(
-                    "          Wrappers: gamemode={}, mangohud={}, gamescope={}, custom={:?}",
-                    config.gamemode, config.mangohud, config.gamescope, config.wrapper
-                );
+            if let Some(ref w) = config.wrapper {
+                println!("          Wrapper:           {}", w);
             }
             return Ok(LaunchResult {
                 appid: game.appid,
@@ -745,10 +711,6 @@ mod tests {
             overlay: true,
             keep_steam: false,
             nojoy: false,
-            gamemode: false,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
             wrapper: None,
             env: Vec::new(),
             extra_args: Vec::new(),
@@ -764,16 +726,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_command_tokens_gamemode_and_gamescope() {
+    fn test_compose_command_tokens_wrapper_prefix() {
         let cfg = ResolvedLaunchConfig {
             overlay: true,
             keep_steam: false,
             nojoy: false,
-            gamemode: true,
-            mangohud: false,
-            gamescope: true,
-            gamescope_args: Some("-W 1920 -H 1080".to_string()),
-            wrapper: None,
+            wrapper: Some("gamemoderun gamescope -W 1920 -H 1080 --".to_string()),
             env: Vec::new(),
             extra_args: Vec::new(),
             cli_args: Vec::new(),
@@ -805,10 +763,6 @@ mod tests {
             overlay: true,
             keep_steam: false,
             nojoy: false,
-            gamemode: false,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
             wrapper: Some("gamemoderun gamescope -W 1920 -- %command% -fullscreen".to_string()),
             env: Vec::new(),
             extra_args: Vec::new(),
@@ -844,10 +798,6 @@ mod tests {
             overlay: false,
             keep_steam: false,
             nojoy: false,
-            gamemode: true,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
             wrapper: None,
             env: vec![("CUSTOM_VAR".to_string(), "1".to_string())],
             extra_args: vec!["-novid".to_string()],
@@ -874,10 +824,6 @@ mod tests {
             overlay: true,
             keep_steam: false,
             nojoy: false,
-            gamemode: false,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
             wrapper: None,
             env: Vec::new(),
             extra_args: Vec::new(),
@@ -1012,10 +958,6 @@ mod tests {
             overlay: false,
             keep_steam: false,
             nojoy: false,
-            gamemode: false,
-            mangohud: false,
-            gamescope: false,
-            gamescope_args: None,
             wrapper: None,
             env: Vec::new(),
             extra_args: Vec::new(),
